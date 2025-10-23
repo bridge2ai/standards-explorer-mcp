@@ -16,10 +16,15 @@ SYNAPSE_BASE_URL = "https://repo-prod.prod.sagebase.org"
 SYNAPSE_TABLE_ID = "syn63096833"
 SYNAPSE_PROJECT_ID = "syn63096806"
 SYNAPSE_TOPICS_TABLE_ID = "syn63096835"
+SYNAPSE_SUBSTRATES_TABLE_ID = "syn63096834"
 
 # Topic name to ID mapping cache
 # Will be populated on first use
 _TOPICS_CACHE: Optional[dict[str, str]] = None
+
+# Substrate name to ID mapping cache
+# Will be populated on first use
+_SUBSTRATES_CACHE: Optional[dict[str, str]] = None
 
 # Authentication can be provided via environment variable
 # Set SYNAPSE_AUTH_TOKEN to a Synapse Personal Access Token or session token
@@ -138,6 +143,72 @@ async def _load_topics_mapping() -> dict[str, str]:
         return {}
 
 
+async def _load_substrates_mapping() -> dict[str, str]:
+    """
+    Load the DataSubstrates table and create a mapping from substrate names to IDs.
+
+    Returns:
+        Dictionary mapping substrate names (lowercase) to substrate IDs
+    """
+    global _SUBSTRATES_CACHE
+
+    if _SUBSTRATES_CACHE is not None:
+        return _SUBSTRATES_CACHE
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            # Query all substrates
+            query_request = {
+                "concreteType": "org.sagebionetworks.repo.model.table.QueryBundleRequest",
+                "entityId": SYNAPSE_SUBSTRATES_TABLE_ID,
+                "query": {
+                    "sql": f"SELECT id, name FROM {SYNAPSE_SUBSTRATES_TABLE_ID}"
+                },
+                "partMask": 0x1 | 0x4 | 0x10
+            }
+
+            headers = {
+                "Content-Type": "application/json",
+                **_get_auth_header()
+            }
+
+            start_response = await client.post(
+                f"{SYNAPSE_BASE_URL}/repo/v1/entity/{SYNAPSE_SUBSTRATES_TABLE_ID}/table/query/async/start",
+                json=query_request,
+                headers=headers
+            )
+            start_response.raise_for_status()
+
+            async_token = start_response.json().get("token")
+            if not async_token:
+                return {}
+
+            result_bundle = await _poll_async_job(client, SYNAPSE_SUBSTRATES_TABLE_ID, async_token, 30)
+
+            # Build the mapping
+            mapping = {}
+            rows = result_bundle.get("queryResult", {}).get(
+                "queryResults", {}).get("rows", [])
+
+            for row in rows:
+                values = row.get("values", [])
+                if len(values) >= 2:
+                    substrate_id = values[0]  # id column
+                    substrate_name = values[1]  # name column
+                    if substrate_id and substrate_name:
+                        # Store both lowercase and original case mappings
+                        mapping[substrate_name.lower()] = substrate_id
+                        mapping[substrate_name] = substrate_id
+
+            _SUBSTRATES_CACHE = mapping
+            return mapping
+
+    except Exception as e:
+        # If we can't load substrates, return empty mapping
+        print(f"Warning: Could not load substrates mapping: {e}")
+        return {}
+
+
 # Core business logic functions (testable)
 async def query_table_impl(
     sql_query: str,
@@ -252,7 +323,8 @@ async def search_standards_impl(
     columns_to_search: Optional[list[str]] = None,
     max_results: int = 10,
     offset: int = 0,
-    include_topic_search: bool = True
+    include_topic_search: bool = True,
+    include_substrate_search: bool = True
 ) -> dict:
     """
     Search for text within the Bridge2AI Standards Explorer table.
@@ -261,7 +333,8 @@ async def search_standards_impl(
     By default, it searches common text columns like name and description.
 
     Additionally, if the search text matches a known data topic name, it will also
-    search the concerns_data_topic column for that topic ID.
+    search the concerns_data_topic column for that topic ID. Similarly, if the search
+    text matches a data substrate name, it will search has_relevant_data_substrate.
 
     Args:
         search_text: The text to search for (case-insensitive)
@@ -269,6 +342,7 @@ async def search_standards_impl(
         max_results: Maximum number of results to return (default: 10)
         offset: Number of results to skip for pagination (default: 0)
         include_topic_search: Whether to also search by topic if name matches (default: True)
+        include_substrate_search: Whether to also search by substrate if name matches (default: True)
 
     Returns:
         Query results matching the search text
@@ -293,6 +367,18 @@ async def search_standards_impl(
             topic_condition = f"concerns_data_topic LIKE '%{matched_topic_id}%'"
             where_conditions = f"({where_conditions}) OR {topic_condition}"
 
+    # Check if search text matches a substrate name
+    substrate_condition = None
+    matched_substrate_id = None
+    if include_substrate_search:
+        substrates_map = await _load_substrates_mapping()
+        matched_substrate_id = substrates_map.get(search_text.lower())
+
+        if matched_substrate_id:
+            # Add substrate search to WHERE clause
+            substrate_condition = f"has_relevant_data_substrate LIKE '%{matched_substrate_id}%'"
+            where_conditions = f"({where_conditions}) OR {substrate_condition}"
+
     sql_query = f"""
         SELECT * FROM {SYNAPSE_TABLE_ID}
         WHERE {where_conditions}
@@ -309,6 +395,11 @@ async def search_standards_impl(
             result["also_searched_topic"] = {
                 "topic_id": matched_topic_id,
                 "topic_name": search_text
+            }
+        if matched_substrate_id:
+            result["also_searched_substrate"] = {
+                "substrate_id": matched_substrate_id,
+                "substrate_name": search_text
             }
 
     return result
@@ -544,6 +635,169 @@ async def search_topics_impl(
         }
 
 
+async def search_by_substrate_impl(
+    substrate_name: str,
+    max_results: int = 20
+) -> dict:
+    """
+    Search for standards related to a specific data substrate.
+
+    This function searches the standards table for entries that concern
+    the specified data substrate by looking up the substrate ID from the
+    DataSubstrate table and finding standards with that substrate ID.
+
+    Args:
+        substrate_name: Name of the substrate to search for (e.g., "Array", "BIDS")
+        max_results: Maximum number of results to return (default: 20)
+
+    Returns:
+        Query results for standards related to the specified substrate
+    """
+    # Load substrates mapping
+    substrates_map = await _load_substrates_mapping()
+
+    # Look up the substrate ID
+    substrate_id = substrates_map.get(substrate_name.lower())
+
+    if not substrate_id:
+        # Try partial matching
+        matching_substrates = {}
+        search_lower = substrate_name.lower()
+        for name, sid in substrates_map.items():
+            if search_lower in name.lower() or name.lower() in search_lower:
+                matching_substrates[name] = sid
+
+        if not matching_substrates:
+            return {
+                "success": False,
+                "error": f"Substrate '{substrate_name}' not found",
+                "available_substrates": list(set(substrates_map.values())),
+                "suggestion": "Try using the list_substrates tool to see available substrates"
+            }
+
+        # If we found multiple matches, use the first one but inform the user
+        substrate_id = list(matching_substrates.values())[0]
+        matched_name = list(matching_substrates.keys())[0]
+    else:
+        matched_name = substrate_name
+
+    # Search for standards with this substrate ID in their has_relevant_data_substrate column
+    # The has_relevant_data_substrate column contains JSON arrays like ["B2AI_SUBSTRATE:11", "B2AI_SUBSTRATE:3"]
+    sql_query = f"""
+        SELECT * FROM {SYNAPSE_TABLE_ID}
+        WHERE has_relevant_data_substrate LIKE '%{substrate_id}%'
+        LIMIT {max_results}
+    """
+
+    result = await query_table_impl(sql_query)
+
+    if result.get("success"):
+        result["substrate_name"] = matched_name
+        result["substrate_id"] = substrate_id
+        result["search_method"] = "substrate"
+
+    return result
+
+
+async def list_substrates_impl() -> dict:
+    """
+    List all available data substrates from the DataSubstrate table.
+
+    Returns:
+        Dictionary containing all available substrates with their IDs and descriptions
+    """
+    try:
+        # Query the substrates table
+        result = await query_table_impl(
+            sql_query=f"SELECT id, name, description FROM {SYNAPSE_SUBSTRATES_TABLE_ID}",
+            max_wait_seconds=30
+        )
+
+        if result.get("success"):
+            substrates = []
+            for row in result.get("rows", []):
+                values = row.get("values", [])
+                if len(values) >= 3:
+                    substrates.append({
+                        "id": values[0],
+                        "name": values[1],
+                        "description": values[2] if values[2] else "No description available"
+                    })
+
+            return {
+                "success": True,
+                "substrates": substrates,
+                "total_substrates": len(substrates),
+                "table_id": SYNAPSE_SUBSTRATES_TABLE_ID
+            }
+        else:
+            return result
+
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"Failed to list substrates: {str(e)}"
+        }
+
+
+async def search_substrates_impl(
+    search_text: str,
+    max_results: int = 20
+) -> dict:
+    """
+    Search for substrates by name or description.
+
+    This function searches the DataSubstrate table for substrates matching the search text.
+
+    Args:
+        search_text: The text to search for in substrate names and descriptions
+        max_results: Maximum number of results to return (default: 20)
+
+    Returns:
+        Matching substrates with their IDs, names, and descriptions
+    """
+    try:
+        # Search substrates table
+        sql_query = f"""
+            SELECT id, name, description FROM {SYNAPSE_SUBSTRATES_TABLE_ID}
+            WHERE name LIKE '%{search_text}%' 
+               OR description LIKE '%{search_text}%'
+            LIMIT {max_results}
+        """
+
+        result = await query_table_impl(
+            sql_query=sql_query,
+            max_wait_seconds=30
+        )
+
+        if result.get("success"):
+            substrates = []
+            for row in result.get("rows", []):
+                values = row.get("values", [])
+                if len(values) >= 3:
+                    substrates.append({
+                        "id": values[0],
+                        "name": values[1],
+                        "description": values[2] if values[2] else "No description available"
+                    })
+
+            return {
+                "success": True,
+                "search_text": search_text,
+                "substrates": substrates,
+                "total_results": len(substrates),
+                "table_id": SYNAPSE_SUBSTRATES_TABLE_ID
+            }
+        else:
+            return result
+
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"Failed to search substrates: {str(e)}"
+        }
+
+
 def get_standards_table_info_impl() -> dict:
     """
     Get information about the Bridge2AI Standards Explorer table.
@@ -562,7 +816,8 @@ def get_standards_table_info_impl() -> dict:
         "description": "This table contains standards information from the Bridge2AI Standards Explorer",
         "synapse_url": f"https://www.synapse.org/#!Synapse:{SYNAPSE_TABLE_ID}",
         "project_url": f"https://www.synapse.org/#!Synapse:{SYNAPSE_PROJECT_ID}",
-        "topics_table_id": SYNAPSE_TOPICS_TABLE_ID
+        "topics_table_id": SYNAPSE_TOPICS_TABLE_ID,
+        "substrates_table_id": SYNAPSE_SUBSTRATES_TABLE_ID
     }
 
 
@@ -734,6 +989,109 @@ async def search_topics(
         List of matching topics with their IDs, names, and descriptions
     """
     return await search_topics_impl(search_text, max_results)
+
+
+@mcp.tool
+async def search_by_substrate(
+    substrate_name: str,
+    max_results: int = 20
+) -> dict:
+    """
+    Search for standards by data substrate name.
+
+    This tool allows searching for standards based on the type of data substrate or format
+    they work with. For example, you can search for standards related to "Array", "BIDS",
+    "JSON", "CSV", etc.
+
+    **When to use this tool:**
+    - When the user asks about standards for a specific data format or structure
+    - When you want to find standards by the type of data substrate they support
+    - To discover what standards are available for a particular file format or data structure
+
+    **Agent Instructions:**
+    If a user asks about standards for a particular data format (e.g., "What standards work with JSON?"),
+    you should:
+    1. First try calling `list_substrates` to see available substrates
+    2. Identify the most relevant substrate name
+    3. Call this tool with that substrate name
+    4. If the substrate isn't found, the error message will suggest using `list_substrates`
+
+    Examples:
+    - "Array" - finds standards that work with array data structures
+    - "BIDS" - finds standards compatible with Brain Imaging Data Structure
+    - "JSON" - finds standards that use JSON format
+    - "CSV" - finds standards that work with CSV files
+
+    Args:
+        substrate_name: The substrate name to search for (case-insensitive)
+        max_results: Maximum number of results to return (default: 20)
+
+    Returns:
+        Standards that work with the specified data substrate
+    """
+    return await search_by_substrate_impl(substrate_name, max_results)
+
+
+@mcp.tool
+async def list_substrates() -> dict:
+    """
+    List all available data substrates.
+
+    This tool returns all data substrates from the Bridge2AI DataSubstrate table, including
+    their IDs, names, and descriptions. Use this to discover what substrates (data formats,
+    structures, and storage systems) are available for searching with the `search_by_substrate` tool.
+
+    **When to use this tool:**
+    - When the user wants to know what data formats/structures are covered
+    - Before using `search_by_substrate` to find the correct substrate name
+    - To help users understand what types of data formats standards support
+
+    Returns:
+        List of all available data substrates with their IDs, names, and descriptions
+    """
+    return await list_substrates_impl()
+
+
+@mcp.tool
+async def search_substrates(
+    search_text: str,
+    max_results: int = 20
+) -> dict:
+    """
+    Search for data substrates by name or description.
+
+    This tool searches the DataSubstrate table to find substrates that match the search text.
+    It searches both the substrate names and descriptions, making it useful for discovering
+    relevant data formats and structures.
+
+    **When to use this tool:**
+    - When the user wants to find substrates related to a specific term
+    - To discover what data formats are available for a particular concept
+    - Before using `search_by_substrate` to find the exact substrate name
+    - When exploring what kinds of data formats are covered in the standards
+
+    **Agent Instructions:**
+    Use this tool when the user asks about data formats or storage systems, such as:
+    - "What substrates are related to databases?"
+    - "Are there substrates for neuroimaging?"
+    - "Show me substrates for tabular data"
+
+    The results can then be used with `search_by_substrate` to find standards for those substrates.
+
+    Examples:
+    - "database" - finds substrates like BigQuery, Column Store, SQL Database
+    - "imaging" - finds substrates like BIDS, NIfTI, DICOM
+    - "table" - finds substrates like CSV, TSV, Column Store
+    - "json" - finds substrates like JSON, JSON-LD
+
+    Args:
+        search_text: The text to search for in substrate names and descriptions
+        max_results: Maximum number of results to return (default: 20)
+
+    Returns:
+        List of matching substrates with their IDs, names, and descriptions
+    """
+    return await search_substrates_impl(search_text, max_results)
 
 
 # Main entrypoint

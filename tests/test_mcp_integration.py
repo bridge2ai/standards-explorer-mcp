@@ -25,9 +25,23 @@ async def test_mcp_list_tools(test_server):
         tools = await client.list_tools()
         tool_names = [tool.name for tool in tools]
 
+        # Basic tools
         assert "query_table" in tool_names
         assert "search_standards" in tool_names
         assert "get_standards_table_info" in tool_names
+
+        # Topic tools
+        assert "search_by_topic" in tool_names
+        assert "list_topics" in tool_names
+        assert "search_topics" in tool_names
+
+        # Substrate tools
+        assert "search_by_substrate" in tool_names
+        assert "list_substrates" in tool_names
+        assert "search_substrates" in tool_names
+
+        # Should have 10 tools total
+        assert len(tool_names) == 10
 
 
 @pytest.mark.asyncio
@@ -42,6 +56,10 @@ async def test_mcp_get_table_info(test_server):
         assert "table_id" in result.data
         assert result.data["table_id"] == "syn63096833"
         assert result.data["project_id"] == "syn63096806"
+        assert "topics_table_id" in result.data
+        assert result.data["topics_table_id"] == "syn63096835"
+        assert "substrates_table_id" in result.data
+        assert result.data["substrates_table_id"] == "syn63096834"
 
 
 @pytest.mark.asyncio
