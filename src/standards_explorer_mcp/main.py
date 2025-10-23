@@ -221,6 +221,74 @@ async def search_standards_impl(
     return result
 
 
+async def search_with_variations_impl(
+    search_text: str,
+    search_variations: list[str],
+    columns_to_search: Optional[list[str]] = None,
+    max_results_per_term: int = 5
+) -> dict:
+    """
+    Search for a term and its variations, returning combined deduplicated results.
+
+    This tool takes a list of search term variations and searches for each one,
+    combining and deduplicating the results.
+
+    Args:
+        search_text: The primary search term
+        search_variations: List of term variations to search (including the original term)
+        columns_to_search: List of column names to search (default: ["name", "description"])
+        max_results_per_term: Maximum results per search term (default: 5)
+
+    Returns:
+        Combined search results from all term variations
+    """
+    all_results = []
+    seen_ids = set()
+
+    # Search for each variation
+    for term in search_variations:
+        result = await search_standards_impl(
+            search_text=term,
+            columns_to_search=columns_to_search,
+            max_results=max_results_per_term,
+            offset=0
+        )
+
+        if result.get("success") and result.get("rows"):
+            # Deduplicate by ID
+            for row in result["rows"]:
+                row_id = row["values"][0] if row.get("values") else None
+                if row_id and row_id not in seen_ids:
+                    seen_ids.add(row_id)
+                    all_results.append({
+                        "row": row,
+                        "matched_term": term,
+                        "is_original": term == search_text
+                    })
+
+    # Get column info from first successful search
+    columns = []
+    if all_results:
+        first_search = await search_standards_impl(
+            search_text=search_text,
+            columns_to_search=columns_to_search,
+            max_results=1,
+            offset=0
+        )
+        columns = first_search.get("columns", [])
+
+    return {
+        "success": True,
+        "original_term": search_text,
+        "search_variations": search_variations,
+        "total_results": len(all_results),
+        "columns": columns,
+        "results": all_results,
+        "table_id": SYNAPSE_TABLE_ID,
+        "project_id": SYNAPSE_PROJECT_ID
+    }
+
+
 def get_standards_table_info_impl() -> dict:
     """
     Get information about the Bridge2AI Standards Explorer table.
@@ -264,6 +332,49 @@ async def search_standards(
 async def get_standards_table_info() -> dict:
     """Get information about the Bridge2AI Standards Explorer table."""
     return get_standards_table_info_impl()
+
+
+@mcp.tool
+async def search_with_variations(
+    search_text: str,
+    search_variations: list[str],
+    columns_to_search: Optional[list[str]] = None,
+    max_results_per_term: int = 5
+) -> dict:
+    """
+    Search for a term using multiple variations and combine results.
+
+    This tool searches for multiple variations of a search term and returns combined,
+    deduplicated results. This is useful when you want to search for related terms,
+    synonyms, abbreviations, or different forms of a word.
+
+    **When to use this tool:**
+    - When a basic search returns no results or too few results
+    - To search for synonyms or related terms (e.g., "waveform", "audio", "signal", "ECG")
+    - To search for both abbreviations and full forms (e.g., "FHIR", "Fast Healthcare Interoperability Resources")
+    - To search for singular/plural forms or spelling variations
+
+    **Agent Instructions:**
+    If the initial `search_standards` call returns no results or insufficient results,
+    you should:
+    1. Generate relevant variations based on the biomedical data science context
+    2. For medical/technical terms, consider: synonyms, abbreviations, related concepts, file formats
+    3. For example, if searching "waveform": try ["waveform", "audio", "wave", "signal", "time-series", "ECG", "EEG"]
+    4. Use this tool with the generated variations
+    5. Explain to the user that you're expanding the search to related terms
+
+    Args:
+        search_text: The primary search term (should also be in search_variations)
+        search_variations: List of all search terms to try (including the original)
+        columns_to_search: List of column names to search (default: ["name", "description"])
+        max_results_per_term: Maximum results per search term (default: 5)
+
+    Returns:
+        Combined search results from all variations, with each result tagged by which term matched it
+    """
+    return await search_with_variations_impl(
+        search_text, search_variations, columns_to_search, max_results_per_term
+    )
 
 
 # Main entrypoint
