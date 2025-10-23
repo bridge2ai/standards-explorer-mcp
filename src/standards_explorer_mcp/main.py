@@ -486,6 +486,64 @@ async def list_topics_impl() -> dict:
         }
 
 
+async def search_topics_impl(
+    search_text: str,
+    max_results: int = 20
+) -> dict:
+    """
+    Search for topics by name or description.
+
+    This function searches the DataTopics table for topics matching the search text.
+
+    Args:
+        search_text: The text to search for in topic names and descriptions
+        max_results: Maximum number of results to return (default: 20)
+
+    Returns:
+        Matching topics with their IDs, names, and descriptions
+    """
+    try:
+        # Search topics table
+        sql_query = f"""
+            SELECT id, name, description FROM {SYNAPSE_TOPICS_TABLE_ID}
+            WHERE name LIKE '%{search_text}%' 
+               OR description LIKE '%{search_text}%'
+            LIMIT {max_results}
+        """
+
+        result = await query_table_impl(
+            sql_query=sql_query,
+            max_wait_seconds=30
+        )
+
+        if result.get("success"):
+            topics = []
+            for row in result.get("rows", []):
+                values = row.get("values", [])
+                if len(values) >= 3:
+                    topics.append({
+                        "id": values[0],
+                        "name": values[1],
+                        "description": values[2] if values[2] else "No description available"
+                    })
+
+            return {
+                "success": True,
+                "search_text": search_text,
+                "topics": topics,
+                "total_results": len(topics),
+                "table_id": SYNAPSE_TOPICS_TABLE_ID
+            }
+        else:
+            return result
+
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"Failed to search topics: {str(e)}"
+        }
+
+
 def get_standards_table_info_impl() -> dict:
     """
     Get information about the Bridge2AI Standards Explorer table.
@@ -634,6 +692,48 @@ async def list_topics() -> dict:
         List of all available data topics with their IDs, names, and descriptions
     """
     return await list_topics_impl()
+
+
+@mcp.tool
+async def search_topics(
+    search_text: str,
+    max_results: int = 20
+) -> dict:
+    """
+    Search for data topics by name or description.
+
+    This tool searches the DataTopics table to find topics that match the search text.
+    It searches both the topic names and descriptions, making it useful for discovering
+    relevant data domains.
+
+    **When to use this tool:**
+    - When the user wants to find topics related to a specific term
+    - To discover what data domains are available for a particular concept
+    - Before using `search_by_topic` to find the exact topic name
+    - When exploring what kinds of data are covered in the standards
+
+    **Agent Instructions:**
+    Use this tool when the user asks about topics or data domains, such as:
+    - "What topics are related to genetics?"
+    - "Are there topics about medical imaging?"
+    - "Show me topics about patient data"
+
+    The results can then be used with `search_by_topic` to find standards for those topics.
+
+    Examples:
+    - "genetic" - finds topics like Gene, Genome, Genomics
+    - "patient" - finds topics like Clinical Observations, EHR, Demographics
+    - "image" - finds topics like Image, Radiology
+    - "time" - finds topics like Waveform, Time Series
+
+    Args:
+        search_text: The text to search for in topic names and descriptions
+        max_results: Maximum number of results to return (default: 20)
+
+    Returns:
+        List of matching topics with their IDs, names, and descriptions
+    """
+    return await search_topics_impl(search_text, max_results)
 
 
 # Main entrypoint
