@@ -67,8 +67,8 @@ async def _poll_async_job(client: httpx.AsyncClient, table_id: str, async_token:
         return response.json()
 
 
-@mcp.tool
-async def query_table(
+# Core business logic functions (testable)
+async def query_table_impl(
     sql_query: str,
     max_wait_seconds: int = 30
 ) -> dict:
@@ -176,8 +176,7 @@ async def query_table(
         }
 
 
-@mcp.tool
-async def search_standards(
+async def search_standards_impl(
     search_text: str,
     columns_to_search: Optional[list[str]] = None,
     max_results: int = 10,
@@ -213,7 +212,7 @@ async def search_standards(
         OFFSET {offset}
     """
 
-    result = await query_table(sql_query)
+    result = await query_table_impl(sql_query)
 
     if result.get("success"):
         result["search_text"] = search_text
@@ -222,8 +221,7 @@ async def search_standards(
     return result
 
 
-@mcp.tool
-async def get_standards_table_info() -> dict:
+def get_standards_table_info_impl() -> dict:
     """
     Get information about the Bridge2AI Standards Explorer table.
 
@@ -242,6 +240,30 @@ async def get_standards_table_info() -> dict:
         "synapse_url": f"https://www.synapse.org/#!Synapse:{SYNAPSE_TABLE_ID}",
         "project_url": f"https://www.synapse.org/#!Synapse:{SYNAPSE_PROJECT_ID}"
     }
+
+
+# MCP tool wrappers
+@mcp.tool
+async def query_table(sql_query: str, max_wait_seconds: int = 30) -> dict:
+    """Query the Bridge2AI Standards Explorer table using SQL."""
+    return await query_table_impl(sql_query, max_wait_seconds)
+
+
+@mcp.tool
+async def search_standards(
+    search_text: str,
+    columns_to_search: Optional[list[str]] = None,
+    max_results: int = 10,
+    offset: int = 0
+) -> dict:
+    """Search for text within the Bridge2AI Standards Explorer table."""
+    return await search_standards_impl(search_text, columns_to_search, max_results, offset)
+
+
+@mcp.tool
+async def get_standards_table_info() -> dict:
+    """Get information about the Bridge2AI Standards Explorer table."""
+    return get_standards_table_info_impl()
 
 
 # Main entrypoint
