@@ -15,6 +15,11 @@ SYNAPSE_BASE_URL = "https://repo-prod.prod.sagebase.org"
 # DataStandardOrTool table and overall project
 SYNAPSE_TABLE_ID = "syn63096833"
 SYNAPSE_PROJECT_ID = "syn63096806"
+SYNAPSE_TOPICS_TABLE_ID = "syn63096835"
+
+# Topic name to ID mapping cache
+# Will be populated on first use
+_TOPICS_CACHE: Optional[dict[str, str]] = None
 
 # Authentication can be provided via environment variable
 # Set SYNAPSE_AUTH_TOKEN to a Synapse Personal Access Token or session token
@@ -65,6 +70,72 @@ async def _poll_async_job(client: httpx.AsyncClient, table_id: str, async_token:
         # Any other status
         response.raise_for_status()
         return response.json()
+
+
+async def _load_topics_mapping() -> dict[str, str]:
+    """
+    Load the DataTopics table and create a mapping from topic names to IDs.
+
+    Returns:
+        Dictionary mapping topic names (lowercase) to topic IDs
+    """
+    global _TOPICS_CACHE
+
+    if _TOPICS_CACHE is not None:
+        return _TOPICS_CACHE
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            # Query all topics
+            query_request = {
+                "concreteType": "org.sagebionetworks.repo.model.table.QueryBundleRequest",
+                "entityId": SYNAPSE_TOPICS_TABLE_ID,
+                "query": {
+                    "sql": f"SELECT id, name FROM {SYNAPSE_TOPICS_TABLE_ID}"
+                },
+                "partMask": 0x1 | 0x4 | 0x10
+            }
+
+            headers = {
+                "Content-Type": "application/json",
+                **_get_auth_header()
+            }
+
+            start_response = await client.post(
+                f"{SYNAPSE_BASE_URL}/repo/v1/entity/{SYNAPSE_TOPICS_TABLE_ID}/table/query/async/start",
+                json=query_request,
+                headers=headers
+            )
+            start_response.raise_for_status()
+
+            async_token = start_response.json().get("token")
+            if not async_token:
+                return {}
+
+            result_bundle = await _poll_async_job(client, SYNAPSE_TOPICS_TABLE_ID, async_token, 30)
+
+            # Build the mapping
+            mapping = {}
+            rows = result_bundle.get("queryResult", {}).get(
+                "queryResults", {}).get("rows", [])
+
+            for row in rows:
+                values = row.get("values", [])
+                if len(values) >= 2:
+                    topic_id = values[0]  # id column
+                    topic_name = values[1]  # name column
+                    if topic_id and topic_name:
+                        # Store both lowercase and original case mappings
+                        mapping[topic_name.lower()] = topic_id
+                        mapping[topic_name] = topic_id
+
+            _TOPICS_CACHE = mapping
+            return mapping
+
+    except Exception as e:
+        # If we can't load topics, return empty mapping
+        print(f"Warning: Could not load topics mapping: {e}")
+        return {}
 
 
 # Core business logic functions (testable)
@@ -180,7 +251,8 @@ async def search_standards_impl(
     search_text: str,
     columns_to_search: Optional[list[str]] = None,
     max_results: int = 10,
-    offset: int = 0
+    offset: int = 0,
+    include_topic_search: bool = True
 ) -> dict:
     """
     Search for text within the Bridge2AI Standards Explorer table.
@@ -188,11 +260,15 @@ async def search_standards_impl(
     This tool searches for text across specified columns in the table (syn63096833).
     By default, it searches common text columns like name and description.
 
+    Additionally, if the search text matches a known data topic name, it will also
+    search the concerns_data_topic column for that topic ID.
+
     Args:
         search_text: The text to search for (case-insensitive)
         columns_to_search: List of column names to search (default: ["name", "description"])
         max_results: Maximum number of results to return (default: 10)
         offset: Number of results to skip for pagination (default: 0)
+        include_topic_search: Whether to also search by topic if name matches (default: True)
 
     Returns:
         Query results matching the search text
@@ -204,6 +280,18 @@ async def search_standards_impl(
     where_conditions = " OR ".join([
         f"{col} LIKE '%{search_text}%'" for col in columns_to_search
     ])
+
+    # Check if search text matches a topic name
+    topic_condition = None
+    matched_topic_id = None
+    if include_topic_search:
+        topics_map = await _load_topics_mapping()
+        matched_topic_id = topics_map.get(search_text.lower())
+
+        if matched_topic_id:
+            # Add topic search to WHERE clause
+            topic_condition = f"concerns_data_topic LIKE '%{matched_topic_id}%'"
+            where_conditions = f"({where_conditions}) OR {topic_condition}"
 
     sql_query = f"""
         SELECT * FROM {SYNAPSE_TABLE_ID}
@@ -217,6 +305,11 @@ async def search_standards_impl(
     if result.get("success"):
         result["search_text"] = search_text
         result["searched_columns"] = columns_to_search
+        if matched_topic_id:
+            result["also_searched_topic"] = {
+                "topic_id": matched_topic_id,
+                "topic_name": search_text
+            }
 
     return result
 
@@ -289,6 +382,110 @@ async def search_with_variations_impl(
     }
 
 
+async def search_by_topic_impl(
+    topic_name: str,
+    max_results: int = 20
+) -> dict:
+    """
+    Search for standards by data topic name.
+
+    This function looks up the topic name in the DataTopics table to find its ID,
+    then searches for standards that concern that topic.
+
+    Args:
+        topic_name: The topic name to search for (case-insensitive, e.g., "EHR", "Genomics")
+        max_results: Maximum number of results to return (default: 20)
+
+    Returns:
+        Query results for standards related to the specified topic
+    """
+    # Load topics mapping
+    topics_map = await _load_topics_mapping()
+
+    # Look up the topic ID
+    topic_id = topics_map.get(topic_name.lower())
+
+    if not topic_id:
+        # Try partial matching
+        matching_topics = {}
+        search_lower = topic_name.lower()
+        for name, tid in topics_map.items():
+            if search_lower in name.lower() or name.lower() in search_lower:
+                matching_topics[name] = tid
+
+        if not matching_topics:
+            return {
+                "success": False,
+                "error": f"Topic '{topic_name}' not found",
+                "available_topics": list(set(topics_map.values())),
+                "suggestion": "Try using the list_topics tool to see available topics"
+            }
+
+        # If we found multiple matches, use the first one but inform the user
+        topic_id = list(matching_topics.values())[0]
+        matched_name = list(matching_topics.keys())[0]
+    else:
+        matched_name = topic_name
+
+    # Search for standards with this topic ID in their concerns_data_topic column
+    # The concerns_data_topic column contains JSON arrays like ["B2AI_TOPIC:12", "B2AI_TOPIC:13"]
+    sql_query = f"""
+        SELECT * FROM {SYNAPSE_TABLE_ID}
+        WHERE concerns_data_topic LIKE '%{topic_id}%'
+        LIMIT {max_results}
+    """
+
+    result = await query_table_impl(sql_query)
+
+    if result.get("success"):
+        result["topic_name"] = matched_name
+        result["topic_id"] = topic_id
+        result["search_method"] = "topic"
+
+    return result
+
+
+async def list_topics_impl() -> dict:
+    """
+    List all available data topics from the DataTopics table.
+
+    Returns:
+        Dictionary containing all available topics with their IDs and descriptions
+    """
+    try:
+        # Query the topics table
+        result = await query_table_impl(
+            sql_query=f"SELECT id, name, description FROM {SYNAPSE_TOPICS_TABLE_ID}",
+            max_wait_seconds=30
+        )
+
+        if result.get("success"):
+            topics = []
+            for row in result.get("rows", []):
+                values = row.get("values", [])
+                if len(values) >= 3:
+                    topics.append({
+                        "id": values[0],
+                        "name": values[1],
+                        "description": values[2] if values[2] else "No description available"
+                    })
+
+            return {
+                "success": True,
+                "topics": topics,
+                "total_topics": len(topics),
+                "table_id": SYNAPSE_TOPICS_TABLE_ID
+            }
+        else:
+            return result
+
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"Failed to list topics: {str(e)}"
+        }
+
+
 def get_standards_table_info_impl() -> dict:
     """
     Get information about the Bridge2AI Standards Explorer table.
@@ -306,7 +503,8 @@ def get_standards_table_info_impl() -> dict:
         "project_name": "Bridge2AI Standards Explorer",
         "description": "This table contains standards information from the Bridge2AI Standards Explorer",
         "synapse_url": f"https://www.synapse.org/#!Synapse:{SYNAPSE_TABLE_ID}",
-        "project_url": f"https://www.synapse.org/#!Synapse:{SYNAPSE_PROJECT_ID}"
+        "project_url": f"https://www.synapse.org/#!Synapse:{SYNAPSE_PROJECT_ID}",
+        "topics_table_id": SYNAPSE_TOPICS_TABLE_ID
     }
 
 
@@ -375,6 +573,67 @@ async def search_with_variations(
     return await search_with_variations_impl(
         search_text, search_variations, columns_to_search, max_results_per_term
     )
+
+
+@mcp.tool
+async def search_by_topic(
+    topic_name: str,
+    max_results: int = 20
+) -> dict:
+    """
+    Search for standards by data topic name.
+
+    This tool allows searching for standards based on the type of data they concern.
+    For example, you can search for standards related to "EHR", "Genomics", "Clinical Observations",
+    "Image", etc.
+
+    **When to use this tool:**
+    - When the user asks about standards for a specific type of data or domain
+    - When you want to find standards by their subject area rather than by name
+    - To discover what standards are available for a particular data type
+
+    **Agent Instructions:**
+    If a user asks about standards for a particular domain (e.g., "What standards are for genomic data?"),
+    you should:
+    1. First try calling `list_topics` to see available topics
+    2. Identify the most relevant topic name
+    3. Call this tool with that topic name
+    4. If the topic isn't found, the error message will suggest using `list_topics`
+
+    Examples:
+    - "EHR" - finds standards for electronic health records
+    - "Genomics" - finds standards for genomic data
+    - "Image" - finds standards for imaging data
+    - "Clinical" - finds standards for clinical observations
+
+    Args:
+        topic_name: The topic name to search for (case-insensitive)
+        max_results: Maximum number of results to return (default: 20)
+
+    Returns:
+        Standards that concern the specified data topic
+    """
+    return await search_by_topic_impl(topic_name, max_results)
+
+
+@mcp.tool
+async def list_topics() -> dict:
+    """
+    List all available data topics.
+
+    This tool returns all data topics from the Bridge2AI DataTopics table, including
+    their IDs, names, and descriptions. Use this to discover what topics are available
+    for searching with the `search_by_topic` tool.
+
+    **When to use this tool:**
+    - When the user wants to know what data domains/types are covered
+    - Before using `search_by_topic` to find the correct topic name
+    - To help users understand how standards are categorized
+
+    Returns:
+        List of all available data topics with their IDs, names, and descriptions
+    """
+    return await list_topics_impl()
 
 
 # Main entrypoint
