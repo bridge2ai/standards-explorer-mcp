@@ -8,19 +8,17 @@ This MCP server provides programmatic access to the Bridge2AI Standards Explorer
 
 ## Features
 
-- **SQL-Based Table Queries**: Execute SQL queries directly against the Bridge2AI Standards Explorer table
+- **SQL-Based Table Queries**: Execute SQL queries directly against the Bridge2AI Standards Explorer tables
 - **Text Search**: Convenient search tool for finding text across multiple columns
 - **Async Job Handling**: Automatically handles Synapse's async query pattern with polling
 - **Pagination Support**: Control the number of results and offset for paginated queries
-- **Table Information**: Get metadata about the Bridge2AI Standards Explorer table and project
-- **Optional Authentication**: Public tables work without authentication; set `SYNAPSE_AUTH_TOKEN` environment variable for authenticated access
-- **Comprehensive Test Suite**: 23 tests covering API endpoints, tool implementations, and integration tests
+- **Table Information**: Get metadata about the Bridge2AI Standards Explorer tables and project
 
 ## Tools
 
 ### `query_table`
 
-Execute SQL queries directly against the Bridge2AI Standards Explorer table.
+Execute SQL queries directly against the Bridge2AI Standards Explorer tables.
 
 **Parameters:**
 - `sql_query` (str, required): SQL query string to execute (e.g., `"SELECT * FROM syn63096833 WHERE name LIKE '%FHIR%' LIMIT 10"`)
@@ -122,9 +120,11 @@ The server is configured to query:
 - **Table ID**: `syn63096833` (Bridge2AI Standards Explorer Table)
 - **Project ID**: `syn63096806` (Bridge2AI Standards Explorer Project)
 - **Base URL**: `https://repo-prod.prod.sagebase.org`
-- **Authentication**: Optional via `SYNAPSE_AUTH_TOKEN` environment variable
+- **Authentication**: Optional via `SYNAPSE_AUTH_TOKEN` environment variable (see below)
 
 ### Authentication (Optional)
+
+This MCP accesses public Synapse tables only, so no authentication should be necessary. If you still need it for some reason, do the following.
 
 For authenticated access, set the `SYNAPSE_AUTH_TOKEN` environment variable:
 
@@ -136,8 +136,6 @@ To get a Synapse Personal Access Token:
 1. Log in to [Synapse](https://www.synapse.org/)
 2. Go to Account Settings → Personal Access Tokens
 3. Create a new token with appropriate scopes (at minimum: view, download)
-
-Public tables work without authentication.
 
 ## Usage
 
@@ -196,39 +194,11 @@ uv run python tests/example_client.py
 ### Run All Tests
 
 ```bash
-# Run complete test suite (23 tests)
+# Run complete test suite
 uv run pytest tests/ -v
 
 # Run with coverage report
 uv run pytest tests/ --cov=src/standards_explorer_mcp --cov-report=html
-```
-
-### Run Specific Test Suites
-
-```bash
-# API endpoint tests (6 tests)
-uv run pytest tests/test_api_endpoints.py -v
-
-# Tool implementation tests (10 tests)
-uv run pytest tests/test_tools.py -v
-
-# Integration tests (7 tests - auto-starts server)
-uv run pytest tests/test_mcp_integration.py -v -m integration
-```
-
-### Test Results
-
-```
-========================= Test Results =========================
-Platform: Linux (Python 3.11.13)
-Test Framework: pytest 8.4.2 with pytest-asyncio 1.2.0
-
-✅ API Endpoint Tests:      6 passed  (~12s)
-✅ Tool Implementation:    10 passed  (~16s)
-✅ Integration Tests:       7 passed  (~5s)
-
-TOTAL:                     23 passed  (~17s)
-================================================================
 ```
 
 **Note:** Integration tests use FastMCP's in-memory transport, automatically starting and stopping the server - no manual server startup required!
