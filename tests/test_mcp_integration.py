@@ -39,9 +39,14 @@ async def test_mcp_list_tools(test_server):
         assert "search_by_substrate" in tool_names
         assert "list_substrates" in tool_names
         assert "search_substrates" in tool_names
+        
+        # Organization tools
+        assert "search_by_organization" in tool_names
+        assert "list_organizations" in tool_names
+        assert "search_organizations" in tool_names
 
-        # Should have 10 tools total
-        assert len(tool_names) == 10
+        # Should have 13 tools total
+        assert len(tool_names) == 13
 
 
 @pytest.mark.asyncio
@@ -60,6 +65,8 @@ async def test_mcp_get_table_info(test_server):
         assert result.data["topics_table_id"] == "syn63096835"
         assert "substrates_table_id" in result.data
         assert result.data["substrates_table_id"] == "syn63096834"
+        assert "organizations_table_id" in result.data
+        assert result.data["organizations_table_id"] == "syn63096836"
 
 
 @pytest.mark.asyncio
