@@ -17,6 +17,7 @@ SYNAPSE_TABLE_ID = "syn63096833"
 SYNAPSE_PROJECT_ID = "syn63096806"
 SYNAPSE_TOPICS_TABLE_ID = "syn63096835"
 SYNAPSE_SUBSTRATES_TABLE_ID = "syn63096834"
+SYNAPSE_ORGANIZATIONS_TABLE_ID = "syn63096836"
 
 # Topic name to ID mapping cache
 # Will be populated on first use
@@ -25,6 +26,10 @@ _TOPICS_CACHE: Optional[dict[str, str]] = None
 # Substrate name to ID mapping cache
 # Will be populated on first use
 _SUBSTRATES_CACHE: Optional[dict[str, str]] = None
+
+# Organization name to ID mapping cache
+# Will be populated on first use
+_ORGANIZATIONS_CACHE: Optional[dict[str, str]] = None
 
 # Authentication can be provided via environment variable
 # Set SYNAPSE_AUTH_TOKEN to a Synapse Personal Access Token or session token
@@ -209,6 +214,73 @@ async def _load_substrates_mapping() -> dict[str, str]:
         return {}
 
 
+async def _load_organizations_mapping() -> dict[str, str]:
+    """
+    Load organization name to ID mappings from the Organizations table.
+
+    Returns a dictionary mapping lowercase organization names to their IDs.
+    Results are cached in _ORGANIZATIONS_CACHE.
+    """
+    global _ORGANIZATIONS_CACHE
+
+    # Return cached mapping if available
+    if _ORGANIZATIONS_CACHE is not None:
+        return _ORGANIZATIONS_CACHE
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            # Query all organizations
+            query_request = {
+                "concreteType": "org.sagebionetworks.repo.model.table.QueryBundleRequest",
+                "entityId": SYNAPSE_ORGANIZATIONS_TABLE_ID,
+                "query": {
+                    "sql": f"SELECT id, name FROM {SYNAPSE_ORGANIZATIONS_TABLE_ID}"
+                },
+                "partMask": 0x1 | 0x4 | 0x10
+            }
+
+            headers = {
+                "Content-Type": "application/json",
+                **_get_auth_header()
+            }
+
+            start_response = await client.post(
+                f"{SYNAPSE_BASE_URL}/repo/v1/entity/{SYNAPSE_ORGANIZATIONS_TABLE_ID}/table/query/async/start",
+                json=query_request,
+                headers=headers
+            )
+            start_response.raise_for_status()
+
+            async_token = start_response.json().get("token")
+            if not async_token:
+                return {}
+
+            result_bundle = await _poll_async_job(client, SYNAPSE_ORGANIZATIONS_TABLE_ID, async_token, 30)
+
+            # Build the mapping
+            mapping = {}
+            rows = result_bundle.get("queryResult", {}).get(
+                "queryResults", {}).get("rows", [])
+
+            for row in rows:
+                values = row.get("values", [])
+                if len(values) >= 2:
+                    org_id = values[0]  # id column
+                    org_name = values[1]  # name column
+                    if org_id and org_name:
+                        # Store both lowercase and original case mappings
+                        mapping[org_name.lower()] = org_id
+                        mapping[org_name] = org_id
+
+            _ORGANIZATIONS_CACHE = mapping
+            return mapping
+
+    except Exception as e:
+        # If we can't load organizations, return empty mapping
+        print(f"Warning: Could not load organizations mapping: {e}")
+        return {}
+
+
 # Core business logic functions (testable)
 async def query_table_impl(
     sql_query: str,
@@ -324,7 +396,8 @@ async def search_standards_impl(
     max_results: int = 10,
     offset: int = 0,
     include_topic_search: bool = True,
-    include_substrate_search: bool = True
+    include_substrate_search: bool = True,
+    include_organization_search: bool = True
 ) -> dict:
     """
     Search for text within the Bridge2AI Standards Explorer table.
@@ -335,6 +408,8 @@ async def search_standards_impl(
     Additionally, if the search text matches a known data topic name, it will also
     search the concerns_data_topic column for that topic ID. Similarly, if the search
     text matches a data substrate name, it will search has_relevant_data_substrate.
+    If it matches an organization name, it will search both has_relevant_organization
+    and responsible_organization columns.
 
     Args:
         search_text: The text to search for (case-insensitive)
@@ -343,6 +418,7 @@ async def search_standards_impl(
         offset: Number of results to skip for pagination (default: 0)
         include_topic_search: Whether to also search by topic if name matches (default: True)
         include_substrate_search: Whether to also search by substrate if name matches (default: True)
+        include_organization_search: Whether to also search by organization if name matches (default: True)
 
     Returns:
         Query results matching the search text
@@ -379,6 +455,18 @@ async def search_standards_impl(
             substrate_condition = f"has_relevant_data_substrate LIKE '%{matched_substrate_id}%'"
             where_conditions = f"({where_conditions}) OR {substrate_condition}"
 
+    # Check if search text matches an organization name
+    organization_condition = None
+    matched_organization_id = None
+    if include_organization_search:
+        organizations_map = await _load_organizations_mapping()
+        matched_organization_id = organizations_map.get(search_text.lower())
+
+        if matched_organization_id:
+            # Add organization search to WHERE clause (search both columns)
+            organization_condition = f"(has_relevant_organization LIKE '%{matched_organization_id}%' OR responsible_organization LIKE '%{matched_organization_id}%')"
+            where_conditions = f"({where_conditions}) OR {organization_condition}"
+
     sql_query = f"""
         SELECT * FROM {SYNAPSE_TABLE_ID}
         WHERE {where_conditions}
@@ -400,6 +488,11 @@ async def search_standards_impl(
             result["also_searched_substrate"] = {
                 "substrate_id": matched_substrate_id,
                 "substrate_name": search_text
+            }
+        if matched_organization_id:
+            result["also_searched_organization"] = {
+                "organization_id": matched_organization_id,
+                "organization_name": search_text
             }
 
     return result
@@ -798,6 +891,178 @@ async def search_substrates_impl(
         }
 
 
+async def search_by_organization_impl(
+    organization_name: str,
+    max_results: int = 20,
+    search_responsible_only: bool = False
+) -> dict:
+    """
+    Search for standards related to a specific organization.
+
+    This function searches the standards table for entries that are related to
+    the specified organization. Organizations can be related to standards in two ways:
+    1. has_relevant_organization - any organization with relevance to the standard
+    2. responsible_organization - organizations with governance over the standard
+
+    Args:
+        organization_name: Name of the organization to search for (e.g., "CDISC", "HL7", "W3C")
+        max_results: Maximum number of results to return (default: 20)
+        search_responsible_only: If True, only search responsible_organization column (default: False)
+
+    Returns:
+        Query results for standards related to the specified organization
+    """
+    # Load organizations mapping
+    organizations_map = await _load_organizations_mapping()
+
+    # Look up the organization ID
+    organization_id = organizations_map.get(organization_name.lower())
+
+    if not organization_id:
+        # Try partial matching
+        matching_orgs = {}
+        search_lower = organization_name.lower()
+        for name, oid in organizations_map.items():
+            if search_lower in name.lower() or name.lower() in search_lower:
+                matching_orgs[name] = oid
+
+        if not matching_orgs:
+            return {
+                "success": False,
+                "error": f"Organization '{organization_name}' not found",
+                "available_organizations": list(set(organizations_map.values())),
+                "suggestion": "Try using the list_organizations tool to see available organizations"
+            }
+
+        # If we found multiple matches, use the first one but inform the user
+        organization_id = list(matching_orgs.values())[0]
+        matched_name = list(matching_orgs.keys())[0]
+    else:
+        matched_name = organization_name
+
+    # Search for standards with this organization ID
+    # The columns contain JSON arrays like ["B2AI_ORG:67", "B2AI_ORG:93"]
+    if search_responsible_only:
+        where_clause = f"responsible_organization LIKE '%{organization_id}%'"
+    else:
+        where_clause = f"(has_relevant_organization LIKE '%{organization_id}%' OR responsible_organization LIKE '%{organization_id}%')"
+
+    sql_query = f"""
+        SELECT * FROM {SYNAPSE_TABLE_ID}
+        WHERE {where_clause}
+        LIMIT {max_results}
+    """
+
+    result = await query_table_impl(sql_query)
+
+    if result.get("success"):
+        result["organization_name"] = matched_name
+        result["organization_id"] = organization_id
+        result["search_method"] = "organization"
+        result["search_responsible_only"] = search_responsible_only
+
+    return result
+
+
+async def list_organizations_impl() -> dict:
+    """
+    List all available organizations from the Organization table.
+
+    Returns:
+        Dictionary containing all available organizations with their IDs and descriptions
+    """
+    try:
+        # Query the organizations table
+        result = await query_table_impl(
+            sql_query=f"SELECT id, name, description FROM {SYNAPSE_ORGANIZATIONS_TABLE_ID}",
+            max_wait_seconds=30
+        )
+
+        if result.get("success"):
+            organizations = []
+            for row in result.get("rows", []):
+                values = row.get("values", [])
+                if len(values) >= 3:
+                    organizations.append({
+                        "id": values[0],
+                        "name": values[1],
+                        "description": values[2] if values[2] else "No description available"
+                    })
+
+            return {
+                "success": True,
+                "organizations": organizations,
+                "total_organizations": len(organizations),
+                "table_id": SYNAPSE_ORGANIZATIONS_TABLE_ID
+            }
+        else:
+            return result
+
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"Failed to list organizations: {str(e)}"
+        }
+
+
+async def search_organizations_impl(
+    search_text: str,
+    max_results: int = 20
+) -> dict:
+    """
+    Search for organizations by name or description.
+
+    This function searches the Organization table for organizations matching the search text.
+
+    Args:
+        search_text: The text to search for in organization names and descriptions
+        max_results: Maximum number of results to return (default: 20)
+
+    Returns:
+        Matching organizations with their IDs, names, and descriptions
+    """
+    try:
+        # Search organizations table
+        sql_query = f"""
+            SELECT id, name, description FROM {SYNAPSE_ORGANIZATIONS_TABLE_ID}
+            WHERE name LIKE '%{search_text}%' 
+               OR description LIKE '%{search_text}%'
+            LIMIT {max_results}
+        """
+
+        result = await query_table_impl(
+            sql_query=sql_query,
+            max_wait_seconds=30
+        )
+
+        if result.get("success"):
+            organizations = []
+            for row in result.get("rows", []):
+                values = row.get("values", [])
+                if len(values) >= 3:
+                    organizations.append({
+                        "id": values[0],
+                        "name": values[1],
+                        "description": values[2] if values[2] else "No description available"
+                    })
+
+            return {
+                "success": True,
+                "search_text": search_text,
+                "organizations": organizations,
+                "total_results": len(organizations),
+                "table_id": SYNAPSE_ORGANIZATIONS_TABLE_ID
+            }
+        else:
+            return result
+
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"Failed to search organizations: {str(e)}"
+        }
+
+
 def get_standards_table_info_impl() -> dict:
     """
     Get information about the Bridge2AI Standards Explorer table.
@@ -817,7 +1082,8 @@ def get_standards_table_info_impl() -> dict:
         "synapse_url": f"https://www.synapse.org/#!Synapse:{SYNAPSE_TABLE_ID}",
         "project_url": f"https://www.synapse.org/#!Synapse:{SYNAPSE_PROJECT_ID}",
         "topics_table_id": SYNAPSE_TOPICS_TABLE_ID,
-        "substrates_table_id": SYNAPSE_SUBSTRATES_TABLE_ID
+        "substrates_table_id": SYNAPSE_SUBSTRATES_TABLE_ID,
+        "organizations_table_id": SYNAPSE_ORGANIZATIONS_TABLE_ID
     }
 
 
@@ -1092,6 +1358,114 @@ async def search_substrates(
         List of matching substrates with their IDs, names, and descriptions
     """
     return await search_substrates_impl(search_text, max_results)
+
+
+@mcp.tool
+async def search_by_organization(
+    organization_name: str,
+    max_results: int = 20,
+    search_responsible_only: bool = False
+) -> dict:
+    """
+    Search for standards by organization name.
+
+    This tool allows searching for standards based on the organizations that created,
+    maintain, or are otherwise associated with them. Organizations can be related to
+    standards in two ways:
+    - has_relevant_organization: Any organization with relevance to the standard
+    - responsible_organization: Organizations with governance over the standard
+
+    **When to use this tool:**
+    - When the user asks about standards from a specific organization
+    - To discover what standards are maintained or created by an organization
+    - To find standards governed by particular bodies (e.g., W3C, HL7, CDISC)
+
+    **Agent Instructions:**
+    If a user asks about standards from an organization (e.g., "What standards does HL7 maintain?"),
+    you should:
+    1. First try calling `list_organizations` to see available organizations
+    2. Identify the most relevant organization name
+    3. Call this tool with that organization name
+    4. If the organization isn't found, the error message will suggest using `list_organizations`
+    5. Use search_responsible_only=True if the user specifically asks about governance/maintenance
+
+    Examples:
+    - "HL7" - finds standards related to Health Level Seven International
+    - "W3C" - finds standards from World Wide Web Consortium
+    - "CDISC" - finds standards from Clinical Data Interchange Standards Consortium
+    - "IEEE" - finds standards from Institute of Electrical and Electronics Engineers
+
+    Args:
+        organization_name: The organization name to search for (case-insensitive)
+        max_results: Maximum number of results to return (default: 20)
+        search_responsible_only: If True, only search responsible_organization (default: False)
+
+    Returns:
+        Standards related to or governed by the specified organization
+    """
+    return await search_by_organization_impl(organization_name, max_results, search_responsible_only)
+
+
+@mcp.tool
+async def list_organizations() -> dict:
+    """
+    List all available organizations.
+
+    This tool returns all organizations from the Bridge2AI Organization table, including
+    their IDs, names, and descriptions. Use this to discover what organizations are
+    available for searching with the `search_by_organization` tool.
+
+    **When to use this tool:**
+    - When the user wants to know what organizations are covered
+    - Before using `search_by_organization` to find the correct organization name
+    - To help users understand what standards bodies and organizations are represented
+
+    Returns:
+        List of all available organizations with their IDs, names, and descriptions
+    """
+    return await list_organizations_impl()
+
+
+@mcp.tool
+async def search_organizations(
+    search_text: str,
+    max_results: int = 20
+) -> dict:
+    """
+    Search for organizations by name or description.
+
+    This tool searches the Organization table to find organizations that match the search text.
+    It searches both the organization names and descriptions, making it useful for discovering
+    relevant standards bodies and organizations.
+
+    **When to use this tool:**
+    - When the user wants to find organizations related to a specific term
+    - To discover what organizations work in a particular domain
+    - Before using `search_by_organization` to find the exact organization name
+    - When exploring what organizations are represented in the standards
+
+    **Agent Instructions:**
+    Use this tool when the user asks about organizations or standards bodies, such as:
+    - "What organizations work on healthcare standards?"
+    - "Are there imaging-related organizations?"
+    - "Show me organizations that deal with data standards"
+
+    The results can then be used with `search_by_organization` to find standards from those organizations.
+
+    Examples:
+    - "healthcare" - finds organizations like HL7, CDISC, CDC
+    - "web" - finds organizations like W3C, WHATWG
+    - "data" - finds organizations working on data standards
+    - "international" - finds international standards bodies
+
+    Args:
+        search_text: The text to search for in organization names and descriptions
+        max_results: Maximum number of results to return (default: 20)
+
+    Returns:
+        List of matching organizations with their IDs, names, and descriptions
+    """
+    return await search_organizations_impl(search_text, max_results)
 
 
 # Main entrypoint
