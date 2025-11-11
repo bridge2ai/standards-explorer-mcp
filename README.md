@@ -280,7 +280,7 @@ standards-explorer-mcp/
 - [Synapse REST API Documentation](https://rest-docs.synapse.org/rest/index.html)
 - [FastMCP Documentation](https://gofastmcp.com/)
 - [Model Context Protocol Specification](https://modelcontextprotocol.io/)
-- [Bridge2AI Standards Explorer on Synapse](https://www.synapse.org/#!Synapse:syn63096806)
+- [Bridge2AI Standards Explorer on Synapse](https://www.synapse.org/Synapse:syn63096806/tables/)
 - [Bridge2AI Standards Explorer Table](https://www.synapse.org/#!Synapse:syn63096833)
 
 ## Troubleshooting
